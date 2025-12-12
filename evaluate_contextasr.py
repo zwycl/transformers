@@ -2,8 +2,8 @@
 """
 Evaluate Whisper models on ContextASR-Bench dataset with shallow fusion biasing.
 
-Supports positive lambda biasing to boost sample-specific entities
-from the dataset's entity_list for improved recognition accuracy.
+Uses HuggingFace transformers implementation with CostSubtractionLogitsProcessor
+for beam search compatibility. Supports batch processing with combined entity lists.
 
 ContextASR-Bench includes:
 - Speech subset: Individual speech samples with domain labels
@@ -13,18 +13,29 @@ Each sample has an entity_list containing domain-specific terms to boost.
 """
 
 import argparse
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import jiwer
 import numpy as np
 import torch
-import whisper
-from whisper.decoding import DecodingTask, DecodingOptions
+from tqdm import tqdm
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
 from whisper.normalizers import BasicTextNormalizer, EnglishTextNormalizer
-from whisper.tokenizer import get_tokenizer
 
 from uncertainty_distillation.data import load_contextasr_bench
 from shallow_fusion import BiasList, ShallowFusionProcessor, ShallowFusionConfig
+
+
+@dataclass
+class EvalResult:
+    """Result for a single sample evaluation."""
+    sample_id: str
+    domain: str
+    reference: str
+    transcription: str
+    wer: float
+    entities: List[str]
 
 
 def create_entity_bias_list(
@@ -48,99 +59,187 @@ def create_entity_bias_list(
     for entity in entities:
         if entity and entity.strip():
             # Add with leading space (how tokens appear mid-sentence in Whisper)
-            # This ensures first token matches what model actually predicts
             bias_list.add_text(" " + entity.strip(), lambda_val=lambda_val)
 
     return bias_list
 
 
-def transcribe_with_model(
-    model,
-    audio: np.ndarray,
-    language: str = "en",
-    shallow_fusion_processor: Optional[ShallowFusionProcessor] = None,
-    beam_size: Optional[int] = 10,
-) -> str:
+def create_combined_entity_bias_list(
+    batch_samples: List[dict],
+    tokenizer,
+    lambda_val: float = 2.0,
+) -> BiasList:
     """
-    Transcribe audio using a Whisper model.
-
-    Handles audio longer than 30 seconds by:
-    - For baseline (no shallow fusion): uses whisper.transcribe() which processes in chunks
-    - For shallow fusion: processes 30-second chunks with overlap and concatenates results
+    Create a combined bias list from all entities in a batch.
 
     Args:
-        model: Whisper model
-        audio: Audio array (16kHz)
-        language: Language code
-        shallow_fusion_processor: Optional processor for shallow fusion biasing
-        beam_size: Beam size for beam search (None for greedy decoding)
+        batch_samples: List of sample dictionaries with entity_list field
+        tokenizer: WhisperTokenizer
+        lambda_val: Lambda value for boosting (positive)
 
     Returns:
-        Transcribed text
+        BiasList configured with all unique entities from the batch
+    """
+    bias_list = BiasList(tokenizer)
+
+    # Collect all unique entities from the batch
+    seen_entities = set()
+    for sample in batch_samples:
+        entities = sample.get("entity_list", [])
+        for entity in entities:
+            if entity and entity.strip():
+                normalized = entity.strip()
+                if normalized not in seen_entities:
+                    seen_entities.add(normalized)
+                    bias_list.add_text(" " + normalized, lambda_val=lambda_val)
+
+    return bias_list
+
+
+def prepare_batch_features(
+    processor: WhisperProcessor,
+    audio_list: List[np.ndarray],
+    device: torch.device,
+) -> tuple:
+    """
+    Prepare batched input features with attention mask for variable length audio.
+
+    Args:
+        processor: WhisperProcessor
+        audio_list: List of audio arrays
+        device: Target device
+
+    Returns:
+        Tuple of (batched_features, attention_mask, original_lengths)
     """
     SAMPLE_RATE = 16000
-    CHUNK_SAMPLES = 30 * SAMPLE_RATE  # 30 seconds
 
-    if shallow_fusion_processor is None:
-        # Baseline: use standard transcribe() which handles long audio properly
-        result = whisper.transcribe(
-            model,
+    # Process each audio to mel features
+    feature_list = []
+    original_lengths = []
+
+    for audio in audio_list:
+        # Ensure audio is numpy array
+        if isinstance(audio, dict):
+            audio = audio["array"]
+
+        # Process to mel features
+        inputs = processor(
             audio,
-            language=language,
-            beam_size=beam_size,
-            without_timestamps=True,
-            condition_on_previous_text=True,
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="pt",
+            truncation=False,
+            padding=False,
         )
-        return result["text"].strip()
-    else:
-        # Shallow fusion: need to process chunks manually since we inject custom logit filters
-        audio_tensor = torch.from_numpy(audio).float()
-        total_samples = audio_tensor.shape[0]
+        features = inputs.input_features.to(device)
+        original_lengths.append(features.shape[-1])
+        feature_list.append(features)
 
-        all_texts = []
-        seek = 0
+    # Find max length and pad all
+    max_frames = max(original_lengths)
 
-        while seek < total_samples:
-            # Extract chunk
-            chunk_end = min(seek + CHUNK_SAMPLES, total_samples)
-            chunk = audio_tensor[seek:chunk_end]
-
-            # Pad to 30 seconds if needed
-            chunk_padded = whisper.pad_or_trim(chunk)
-            mel = whisper.log_mel_spectrogram(chunk_padded, n_mels=model.dims.n_mels).to(model.device)
-
-            # Reset shallow fusion state for each chunk
-            shallow_fusion_processor.reset()
-
-            options = DecodingOptions(language=language, without_timestamps=True, beam_size=beam_size)
-            task = DecodingTask(model, options)
-
-            logit_filter = shallow_fusion_processor.get_logit_filter(
-                sample_begin=task.sample_begin
+    padded_features = []
+    for features in feature_list:
+        if features.shape[-1] < max_frames:
+            features = torch.nn.functional.pad(
+                features,
+                (0, max_frames - features.shape[-1]),
             )
-            task.logit_filters.append(logit_filter)
+        padded_features.append(features)
 
-            result = task.run(mel.unsqueeze(0))[0]
-            text = result.text.strip()
+    # Stack into batch
+    batched_features = torch.cat(padded_features, dim=0)
 
-            if text:
-                all_texts.append(text)
+    # Create attention mask
+    attention_mask = torch.zeros(len(feature_list), max_frames, device=device)
+    for i, orig_len in enumerate(original_lengths):
+        attention_mask[i, :orig_len] = 1
 
-            seek += CHUNK_SAMPLES
+    return batched_features, attention_mask, original_lengths
 
-        return " ".join(all_texts)
+
+def transcribe_batch(
+    model: WhisperForConditionalGeneration,
+    processor: WhisperProcessor,
+    batch_samples: List[dict],
+    language: str = "en",
+    beam_size: int = 5,
+    use_shallow_fusion: bool = False,
+    lambda_val: float = 2.0,
+) -> List[str]:
+    """
+    Batch transcribe audio samples.
+
+    Args:
+        model: WhisperForConditionalGeneration model
+        processor: WhisperProcessor
+        batch_samples: List of sample dictionaries with audio and entity_list
+        language: Language code
+        beam_size: Beam size for beam search
+        use_shallow_fusion: Whether to use shallow fusion
+        lambda_val: Lambda value for entity boosting
+
+    Returns:
+        List of transcriptions
+    """
+    device = next(model.parameters()).device
+
+    # Prepare audio list
+    audio_list = []
+    for sample in batch_samples:
+        audio = sample["audio"]
+        if isinstance(audio, dict):
+            audio = audio["array"]
+        audio_list.append(audio)
+
+    # Prepare batched features
+    batched_features, attention_mask, _ = prepare_batch_features(
+        processor, audio_list, device
+    )
+
+    # Create shallow fusion processor if enabled
+    logits_processor_list = []
+    if use_shallow_fusion:
+        combined_bias_list = create_combined_entity_bias_list(
+            batch_samples,
+            processor.tokenizer,
+            lambda_val=lambda_val,
+        )
+        if len(combined_bias_list) > 0:
+            config = ShallowFusionConfig(global_scale=1.0)
+            sf_processor = ShallowFusionProcessor.from_bias_list(
+                combined_bias_list, config
+            )
+            logits_processor = sf_processor.get_cost_subtraction_processor()
+            logits_processor_list.append(logits_processor)
+
+    # Generate
+    generate_kwargs = {
+        "attention_mask": attention_mask,
+        "num_beams": beam_size,
+        "return_timestamps": True,
+        "language": language,
+        "task": "transcribe",
+    }
+
+    if logits_processor_list:
+        generate_kwargs["logits_processor"] = logits_processor_list
+
+    outputs = model.generate(batched_features, **generate_kwargs)
+
+    # Decode
+    transcriptions = processor.batch_decode(outputs, skip_special_tokens=True)
+    return [t.strip() for t in transcriptions]
 
 
 def compute_wer(reference: str, hypothesis: str, normalizer) -> float:
     """
-    Compute Word Error Rate between reference and hypothesis using jiwer.
-
-    Uses EnglishTextNormalizer for English or BasicTextNormalizer for other languages.
+    Compute Word Error Rate between reference and hypothesis.
 
     Args:
         reference: Ground truth transcription
         hypothesis: Model's transcription
-        normalizer: Text normalizer (EnglishTextNormalizer or BasicTextNormalizer)
+        normalizer: Text normalizer
 
     Returns:
         Word Error Rate as a float
@@ -154,31 +253,29 @@ def compute_wer(reference: str, hypothesis: str, normalizer) -> float:
     return jiwer.wer(ref_normalized, hyp_normalized)
 
 
+def batch_iterator(items, batch_size):
+    """Yield batches of items."""
+    for i in range(0, len(items), batch_size):
+        yield items[i:i + batch_size]
+
+
 def print_sample_result(
     sample_id: str,
     reference: str,
-    transcriptions: Dict[str, str],
-    wer_scores: Dict[str, float],
+    transcription: str,
+    wer: float,
     entities: List[str],
     domain: str,
 ):
     """Print formatted result for a single sample."""
-    print(f"\n{'='*100}")
-    print(f"  SAMPLE: {sample_id} | Domain: {domain}")
-    print(f"  Entities: {', '.join(entities[:5])}{'...' if len(entities) > 5 else ''}")
-    print(f"{'='*100}")
-    print(f"  |{'-'*20}|{'-'*70}|{'-'*8}|")
+    print(f"\n  {sample_id} | {domain} | WER: {wer:.1%}")
+    print(f"  Entities: {', '.join(entities[:3])}{'...' if len(entities) > 3 else ''}")
 
-    for model_name, text in transcriptions.items():
-        wer = wer_scores.get(model_name, 0)
-        display_text = text[:65] + "..." if len(text) > 65 else text
-        print(f"  | {model_name:<18} | {display_text:<68} | {wer:>5.1%} |")
+    ref_display = reference[:80] + "..." if len(reference) > 80 else reference
+    hyp_display = transcription[:80] + "..." if len(transcription) > 80 else transcription
 
-    print(f"  |{'-'*20}|{'-'*70}|{'-'*8}|")
-
-    ref_display = reference[:65] + "..." if len(reference) > 65 else reference
-    print(f"  | {'Reference':<18} | {ref_display:<68} |        |")
-    print(f"  |{'-'*20}|{'-'*70}|{'-'*8}|")
+    print(f"  REF: {ref_display}")
+    print(f"  HYP: {hyp_display}")
 
 
 def main():
@@ -188,15 +285,14 @@ def main():
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=10,
-        help="Number of samples to evaluate (default: 10)",
+        default=100,
+        help="Number of samples to evaluate (default: 100)",
     )
     parser.add_argument(
-        "--models",
+        "--model",
         type=str,
-        nargs="+",
-        default=["tiny"],
-        help="Whisper models to evaluate (default: tiny)",
+        default="openai/whisper-small",
+        help="HuggingFace Whisper model (default: openai/whisper-small)",
     )
     parser.add_argument(
         "--subset",
@@ -204,6 +300,12 @@ def main():
         choices=["Speech", "Dialogue"],
         default="Speech",
         help="ContextASR-Bench subset (default: Speech)",
+    )
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help="Filter by domain (e.g., medical, legal, finance)",
     )
     parser.add_argument(
         "--language",
@@ -225,8 +327,14 @@ def main():
     parser.add_argument(
         "--beam-size",
         type=int,
-        default=10,
-        help="Beam size for beam search (default: 10)",
+        default=5,
+        help="Beam size for beam search (default: 5)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Batch size for inference (default: 4)",
     )
     parser.add_argument(
         "--output",
@@ -245,11 +353,22 @@ def main():
         default=42,
         help="Random seed (default: 42)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed results for each sample",
+    )
 
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    # Load model and processor
+    print(f"\nLoading model: {args.model}...")
+    model = WhisperForConditionalGeneration.from_pretrained(args.model).to(device)
+    processor = WhisperProcessor.from_pretrained(args.model)
+    model.eval()
 
     # Load samples from ContextASR-Bench
     print(f"\nLoading ContextASR-Bench ({args.subset}, {args.language})...")
@@ -260,111 +379,119 @@ def main():
         random_sample=args.random_sample,
         seed=args.seed,
     )
-    print(f"  Loaded {len(samples)} samples")
 
-    # Get tokenizer for shallow fusion
-    whisper_lang = "en" if args.language == "English" else "zh"
-    tokenizer = None
-    if args.use_shallow_fusion:
-        tokenizer = get_tokenizer(multilingual=True, language=whisper_lang)
-        print(f"\nShallow fusion enabled with lambda={args.lambda_val}")
+    # Filter by domain if specified
+    if args.domain:
+        samples = [s for s in samples if args.domain.lower() in s.get("domain_label", "").lower()]
+        print(f"  Filtered to {len(samples)} {args.domain} samples")
+    else:
+        print(f"  Loaded {len(samples)} samples")
 
     # Create text normalizer for WER computation
+    whisper_lang = "en" if args.language == "English" else "zh"
     if args.language == "English":
         normalizer = EnglishTextNormalizer()
     else:
         normalizer = BasicTextNormalizer()
 
-    # Load models
-    models = {}
-    for model_name in args.models:
-        print(f"\nLoading Whisper {model_name}...")
-        models[model_name] = whisper.load_model(model_name, device=device)
-
-    # Process samples
-    fusion_status = f" [SHALLOW FUSION λ={args.lambda_val}]" if args.use_shallow_fusion else ""
-    beam_status = f" [BEAM SIZE={args.beam_size}]" if args.beam_size else " [GREEDY]"
-    print(f"\n{'='*100}")
-    print(f"  CONTEXTASR-BENCH EVALUATION - {len(samples)} samples{fusion_status}{beam_status}")
-    print(f"{'='*100}")
+    # Run evaluation
+    fusion_status = f" [SHALLOW FUSION λ={args.lambda_val}]" if args.use_shallow_fusion else " [BASELINE]"
+    print(f"\n{'='*80}")
+    print(f"EVALUATION: {args.model}{fusion_status}")
+    print(f"Samples: {len(samples)} | Batch size: {args.batch_size} | Beam size: {args.beam_size}")
+    print(f"{'='*80}")
 
     results = []
-    total_wer = {model_name: [] for model_name in args.models}
+    all_wer = []
 
-    for sample in samples:
-        sample_id = sample["id"]
-        audio = sample["audio"]
-        reference = sample.get("text", "")
-        entities = sample.get("entity_list", [])
-        domain = sample.get("domain_label", "unknown")
+    # Process in batches with progress bar
+    batches = list(batch_iterator(samples, args.batch_size))
 
-        # Create per-sample shallow fusion processor if enabled
-        shallow_fusion_processor = None
-        if args.use_shallow_fusion and entities and tokenizer:
-            bias_list = create_entity_bias_list(
+    for batch in tqdm(batches, desc="Evaluating"):
+        # Transcribe batch
+        transcriptions = transcribe_batch(
+            model=model,
+            processor=processor,
+            batch_samples=batch,
+            language=whisper_lang,
+            beam_size=args.beam_size,
+            use_shallow_fusion=args.use_shallow_fusion,
+            lambda_val=args.lambda_val,
+        )
+
+        # Compute WER for each sample
+        for sample, transcription in zip(batch, transcriptions):
+            sample_id = sample["id"]
+            reference = sample.get("text", "")
+            entities = sample.get("entity_list", [])
+            domain = sample.get("domain_label", "unknown")
+
+            wer = compute_wer(reference, transcription, normalizer)
+            all_wer.append(wer)
+
+            result = EvalResult(
+                sample_id=sample_id,
+                domain=domain,
+                reference=reference,
+                transcription=transcription,
+                wer=wer,
                 entities=entities,
-                tokenizer=tokenizer,
-                lambda_val=args.lambda_val,
             )
-            if len(bias_list) > 0:
-                config = ShallowFusionConfig(global_scale=1.0)
-                shallow_fusion_processor = ShallowFusionProcessor.from_bias_list(
-                    bias_list, config
+            results.append(result)
+
+            if args.verbose:
+                print_sample_result(
+                    sample_id, reference, transcription, wer, entities, domain
                 )
 
-        # Transcribe with each model
-        transcriptions = {}
-        wer_scores = {}
-
-        for model_name, model in models.items():
-            text = transcribe_with_model(
-                model, audio, whisper_lang, shallow_fusion_processor, args.beam_size
-            )
-            transcriptions[model_name] = text
-
-            # Compute WER if reference is available
-            if reference:
-                wer = compute_wer(reference, text, normalizer)
-                wer_scores[model_name] = wer
-                total_wer[model_name].append(wer)
-
-        # Print result
-        print_sample_result(sample_id, reference, transcriptions, wer_scores, entities, domain)
-
-        # Store results
-        result = {
-            "sample_id": sample_id,
-            "domain": domain,
-            "entities": "|".join(entities),
-            "reference": reference,
-        }
-        for model_name, text in transcriptions.items():
-            result[f"whisper_{model_name}"] = text
-            result[f"wer_{model_name}"] = wer_scores.get(model_name, None)
-        results.append(result)
-
     # Summary
-    print(f"\n{'='*100}")
-    print(f"  EVALUATION SUMMARY")
-    print(f"{'='*100}")
+    print(f"\n{'='*80}")
+    print(f"EVALUATION SUMMARY")
+    print(f"{'='*80}")
 
-    print(f"\n  Average Word Error Rate (WER):")
-    print(f"  {'-'*50}")
+    avg_wer = np.mean(all_wer)
+    std_wer = np.std(all_wer)
+    median_wer = np.median(all_wer)
 
-    for model_name in args.models:
-        if total_wer[model_name]:
-            avg_wer = np.mean(total_wer[model_name])
-            std_wer = np.std(total_wer[model_name])
-            print(f"  Whisper {model_name:<10}: {avg_wer:.1%} (±{std_wer:.1%})")
+    print(f"\n  Model: {args.model}")
+    print(f"  Shallow Fusion: {'Yes (λ=' + str(args.lambda_val) + ')' if args.use_shallow_fusion else 'No'}")
+    print(f"  Samples: {len(results)}")
+    print(f"\n  Average WER: {avg_wer:.1%} (±{std_wer:.1%})")
+    print(f"  Median WER:  {median_wer:.1%}")
 
-    print(f"  {'-'*50}")
+    # Domain breakdown
+    domain_wer = {}
+    for r in results:
+        if r.domain not in domain_wer:
+            domain_wer[r.domain] = []
+        domain_wer[r.domain].append(r.wer)
+
+    if len(domain_wer) > 1:
+        print(f"\n  WER by Domain:")
+        print(f"  {'-'*40}")
+        for domain, wers in sorted(domain_wer.items()):
+            print(f"  {domain:<20}: {np.mean(wers):.1%} ({len(wers)} samples)")
 
     # Save results
     if args.output:
         import pandas as pd
-        df = pd.DataFrame(results)
+        df = pd.DataFrame([
+            {
+                "sample_id": r.sample_id,
+                "domain": r.domain,
+                "reference": r.reference,
+                "transcription": r.transcription,
+                "wer": r.wer,
+                "entities": "|".join(r.entities),
+            }
+            for r in results
+        ])
         df.to_csv(args.output, index=False)
         print(f"\n  Results saved to: {args.output}")
+
+    print(f"\n{'='*80}")
+
+    return avg_wer
 
 
 if __name__ == "__main__":

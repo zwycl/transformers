@@ -166,8 +166,8 @@ def transcribe_with_shallow_fusion(
     Returns:
         TranscriptionResult with transcription, hypotheses, and segment info
     """
-    # Get logits processor for shallow fusion
-    logits_processor = shallow_fusion_processor.get_logits_processor()
+    # Get logits processor for shallow fusion with cost subtraction for beam search
+    logits_processor = shallow_fusion_processor.get_cost_subtraction_processor()
 
     # Generate with shallow fusion
     # Use return_timestamps=True for long-form audio transcription
@@ -198,6 +198,145 @@ def transcribe_with_shallow_fusion(
         hypotheses=[transcription],
         segments=segments,
     )
+
+
+def transcribe_batch_with_shallow_fusion(
+    model: WhisperForConditionalGeneration,
+    processor: WhisperProcessor,
+    input_features: torch.Tensor,
+    shallow_fusion_processor: ShallowFusionProcessor,
+    attention_mask: torch.Tensor = None,
+    n_beams: int = 10,
+    language: str = "en",
+) -> List[TranscriptionResult]:
+    """
+    Batch transcribe audio using shallow fusion with combined entity biasing.
+
+    Args:
+        model: WhisperForConditionalGeneration model
+        processor: WhisperProcessor
+        input_features: Batched input features [batch_size, n_mels, n_frames]
+        shallow_fusion_processor: Shallow fusion processor with combined entity biases
+        attention_mask: Attention mask for batched long-form audio
+        n_beams: Number of beams for beam search
+        language: Language code
+
+    Returns:
+        List of TranscriptionResult, one per sample in batch
+    """
+    batch_size = input_features.shape[0]
+
+    # Get logits processor for shallow fusion with cost subtraction for beam search
+    logits_processor = shallow_fusion_processor.get_cost_subtraction_processor()
+
+    # Generate with shallow fusion for entire batch
+    outputs = model.generate(
+        input_features,
+        attention_mask=attention_mask,
+        num_beams=n_beams,
+        logits_processor=[logits_processor],
+        return_timestamps=True,
+        language=language,
+        task="transcribe",
+    )
+
+    # Decode all transcriptions at once
+    transcriptions = processor.batch_decode(outputs, skip_special_tokens=True)
+
+    # Build results for each sample
+    results = []
+    for i in range(batch_size):
+        transcription = transcriptions[i].strip() if i < len(transcriptions) else ""
+        results.append(TranscriptionResult(
+            transcription=transcription,
+            hypotheses=[transcription],
+            segments=None,
+        ))
+
+    return results
+
+
+def transcribe_batch_standard(
+    model: WhisperForConditionalGeneration,
+    processor: WhisperProcessor,
+    input_features: torch.Tensor,
+    attention_mask: torch.Tensor = None,
+    n_beams: int = 10,
+    language: str = "en",
+) -> List[TranscriptionResult]:
+    """
+    Batch transcribe audio without shallow fusion.
+
+    Args:
+        model: WhisperForConditionalGeneration model
+        processor: WhisperProcessor
+        input_features: Batched input features [batch_size, n_mels, n_frames]
+        attention_mask: Attention mask for batched long-form audio
+        n_beams: Number of beams for beam search
+        language: Language code
+
+    Returns:
+        List of TranscriptionResult, one per sample in batch
+    """
+    batch_size = input_features.shape[0]
+
+    # Generate for entire batch
+    outputs = model.generate(
+        input_features,
+        attention_mask=attention_mask,
+        num_beams=n_beams,
+        return_timestamps=True,
+        language=language,
+        task="transcribe",
+    )
+
+    # Decode all transcriptions at once
+    transcriptions = processor.batch_decode(outputs, skip_special_tokens=True)
+
+    # Build results for each sample
+    results = []
+    for i in range(batch_size):
+        transcription = transcriptions[i].strip() if i < len(transcriptions) else ""
+        results.append(TranscriptionResult(
+            transcription=transcription,
+            hypotheses=[transcription],
+            segments=None,
+        ))
+
+    return results
+
+
+def create_combined_entity_bias_list(
+    batch_samples: List[dict],
+    tokenizer,
+    lambda_val: float = 2.0,
+) -> BiasList:
+    """
+    Create a combined bias list from all entities in a batch.
+
+    Args:
+        batch_samples: List of sample dictionaries with entity_list field
+        tokenizer: WhisperTokenizer
+        lambda_val: Lambda value for boosting (positive)
+
+    Returns:
+        BiasList configured with all unique entities from the batch
+    """
+    bias_list = BiasList(tokenizer)
+
+    # Collect all unique entities from the batch
+    seen_entities = set()
+    for sample in batch_samples:
+        entities = sample.get("entity_list", [])
+        for entity in entities:
+            if entity and entity.strip():
+                normalized = entity.strip()
+                if normalized not in seen_entities:
+                    seen_entities.add(normalized)
+                    # Add with leading space (how tokens appear mid-sentence in Whisper)
+                    bias_list.add_text(" " + normalized, lambda_val=lambda_val)
+
+    return bias_list
 
 
 def transcribe_standard(
@@ -549,6 +688,202 @@ def process_sample(
     )
 
 
+def process_batch(
+    batch_samples: List[dict],
+    model: WhisperForConditionalGeneration,
+    processor: WhisperProcessor,
+    ensemble: SignalEnsemble,
+    gradnorm_extractor: Optional[GradNormExtractor],
+    args,
+    use_shallow_fusion: bool = False,
+) -> List[SampleResult]:
+    """
+    Process a batch of audio samples with batched transcription and signal extraction.
+
+    Combines all entity lists from the batch for shallow fusion, then transcribes
+    all samples together using batch decoding.
+
+    Args:
+        batch_samples: List of sample dictionaries with audio, text, entity_list
+        model: WhisperForConditionalGeneration model
+        processor: WhisperProcessor
+        ensemble: SignalEnsemble instance
+        gradnorm_extractor: GradNorm extractor (or None)
+        args: Command line arguments
+        use_shallow_fusion: Whether to use shallow fusion with combined entities
+
+    Returns:
+        List of SampleResult, one per sample in batch
+    """
+    device = next(model.parameters()).device
+    batch_size = len(batch_samples)
+
+    # Prepare batched input features - pad all to same length
+    audio_list = [sample["audio"] for sample in batch_samples]
+
+    # Find max length and pad all to the longest in batch (no truncation for long-form)
+    max_frames = 0
+    feature_list = []
+    original_lengths = []
+    for audio in audio_list:
+        features = prepare_input_features(processor, audio, device, truncation=False)
+        original_lengths.append(features.shape[-1])
+        max_frames = max(max_frames, features.shape[-1])
+        feature_list.append(features)
+
+    # Pad all features to same size (longest in batch) - Whisper handles long-form internally
+    padded_features = []
+    for features in feature_list:
+        if features.shape[-1] < max_frames:
+            features = torch.nn.functional.pad(
+                features,
+                (0, max_frames - features.shape[-1]),
+            )
+        padded_features.append(features)
+
+    # Stack into batch [batch_size, n_mels, n_frames]
+    batched_features = torch.cat(padded_features, dim=0)
+
+    # Create attention mask for long-form batched decoding
+    # Mask is 1 for real frames, 0 for padded frames
+    attention_mask = torch.zeros(len(feature_list), max_frames, device=device)
+    for i, orig_len in enumerate(original_lengths):
+        attention_mask[i, :orig_len] = 1
+
+    # Create combined shallow fusion processor if enabled
+    shallow_fusion_processor = None
+    if use_shallow_fusion:
+        combined_bias_list = create_combined_entity_bias_list(
+            batch_samples,
+            processor.tokenizer,
+            lambda_val=args.lambda_val,
+        )
+        if len(combined_bias_list) > 0:
+            config = ShallowFusionConfig(global_scale=1.0)
+            shallow_fusion_processor = ShallowFusionProcessor.from_bias_list(
+                combined_bias_list, config
+            )
+            print(f"  Batch shallow fusion: {len(combined_bias_list)} unique entities loaded")
+
+    # Batch transcribe
+    if shallow_fusion_processor is not None:
+        trans_results = transcribe_batch_with_shallow_fusion(
+            model, processor, batched_features, shallow_fusion_processor,
+            attention_mask=attention_mask,
+            n_beams=args.n_beams, language=args.language
+        )
+    else:
+        trans_results = transcribe_batch_standard(
+            model, processor, batched_features,
+            attention_mask=attention_mask,
+            n_beams=args.n_beams, language=args.language
+        )
+
+    # Now extract signals for each sample individually (signal extraction needs per-sample processing)
+    results = []
+    forced_decoder_ids = processor.get_decoder_prompt_ids(
+        language=args.language,
+        task="transcribe",
+        no_timestamps=True,
+    )
+    decoder_start = [model.config.decoder_start_token_id]
+    forced_tokens = [t[1] for t in forced_decoder_ids] if forced_decoder_ids else []
+    sot_len = len(decoder_start) + len(forced_tokens)
+
+    for i, (sample, trans_result) in enumerate(zip(batch_samples, trans_results)):
+        transcription = trans_result.transcription
+        input_features = padded_features[i]  # [n_mels, n_frames]
+
+        # Add batch dimension if needed
+        if input_features.dim() == 2:
+            input_features = input_features.unsqueeze(0)
+
+        n_frames = input_features.shape[-1]
+        is_longform = n_frames > MAX_ENCODER_FRAMES
+
+        # Build tokens from transcription
+        text_tokens = processor.tokenizer.encode(transcription, add_special_tokens=False)
+        tokens = torch.tensor(decoder_start + forced_tokens + text_tokens).to(device)
+
+        # Extract signals - process per-chunk for long-form audio
+        if is_longform:
+            # Process signals in chunks and aggregate
+            chunk_signals_list = []
+            chunk_gradnorms = []
+            num_chunks = (n_frames + MAX_ENCODER_FRAMES - 1) // MAX_ENCODER_FRAMES
+
+            for chunk_idx in range(num_chunks):
+                start_frame = chunk_idx * MAX_ENCODER_FRAMES
+                end_frame = min(start_frame + MAX_ENCODER_FRAMES, n_frames)
+                chunk_features = input_features[:, :, start_frame:end_frame]
+
+                # Pad last chunk if needed
+                if chunk_features.shape[-1] < MAX_ENCODER_FRAMES:
+                    chunk_features = torch.nn.functional.pad(
+                        chunk_features,
+                        (0, MAX_ENCODER_FRAMES - chunk_features.shape[-1]),
+                    )
+
+                # Extract signals for this chunk
+                chunk_signals = ensemble.extract_all(
+                    chunk_features,
+                    tokens,
+                    skip_nbest=True,
+                    skip_feature_distance=args.skip_feature_distance,
+                    skip_attention_entropy=True,
+                )
+                chunk_signals_list.append(chunk_signals)
+
+                # Extract GradNorm for this chunk if enabled
+                if gradnorm_extractor is not None:
+                    chunk_gradnorm_result = gradnorm_extractor.extract(chunk_features, tokens)
+                    chunk_gradnorms.append(chunk_gradnorm_result.gradnorm)
+
+            # Use first chunk signals (UncertaintySignals has read-only properties)
+            # For long-form, we use the first chunk's signals as representative
+            signals = chunk_signals_list[0]
+
+            gradnorm = None
+            if chunk_gradnorms:
+                gradnorm = torch.mean(torch.stack(chunk_gradnorms))
+        else:
+            # Short-form: pad to MAX_ENCODER_FRAMES if needed
+            signal_features = input_features
+            if signal_features.shape[-1] < MAX_ENCODER_FRAMES:
+                signal_features = torch.nn.functional.pad(
+                    signal_features,
+                    (0, MAX_ENCODER_FRAMES - signal_features.shape[-1]),
+                )
+
+            # Extract signals for this sample
+            signals = ensemble.extract_all(
+                signal_features,
+                tokens,
+                skip_nbest=True,
+                skip_feature_distance=args.skip_feature_distance,
+                skip_attention_entropy=True,
+            )
+
+            # Extract GradNorm if enabled
+            gradnorm = None
+            if gradnorm_extractor is not None:
+                gradnorm_result = gradnorm_extractor.extract(signal_features, tokens)
+                gradnorm = gradnorm_result.gradnorm
+
+        results.append(SampleResult(
+            transcription=transcription,
+            tokens=tokens,
+            sot_len=sot_len,
+            signals=signals,
+            nbest_hypotheses=[transcription],
+            gradnorm=gradnorm,
+            segments=None,
+            is_longform=False,
+        ))
+
+    return results
+
+
 def format_uncertainty_bar(value: float, max_width: int = 20) -> str:
     """Create a visual bar for uncertainty value."""
     filled = int(value * max_width)
@@ -814,12 +1149,19 @@ def main():
             domain_filter=args.domain,
         )
 
-        # Process reference samples in batches for efficiency
+        # Process reference samples - pad each to MAX_ENCODER_FRAMES for consistency
         ref_features = []
-        for batch in batch_iterator(ref_samples, args.batch_size):
-            batch_audio = [sample["audio"] for sample in batch]
-            batch_features = prepare_batch_input_features(processor, batch_audio, device)
-            ref_features.extend([batch_features[i] for i in range(batch_features.shape[0])])
+        for sample in ref_samples:
+            features = prepare_input_features(processor, sample["audio"], device, truncation=False)
+            # Pad or truncate to MAX_ENCODER_FRAMES (3000 frames = 30 seconds)
+            if features.shape[-1] < MAX_ENCODER_FRAMES:
+                features = torch.nn.functional.pad(
+                    features,
+                    (0, MAX_ENCODER_FRAMES - features.shape[-1]),
+                )
+            elif features.shape[-1] > MAX_ENCODER_FRAMES:
+                features = features[:, :, :MAX_ENCODER_FRAMES]
+            ref_features.append(features.squeeze(0))  # Remove batch dim
 
         features_stacked = torch.stack(ref_features, dim=0)
         print(f"  Computing reference stats from {len(ref_features)} samples (using Ledoit-Wolf shrinkage)...")
@@ -833,58 +1175,37 @@ def main():
     print("=" * 80)
 
     sample_idx = 0
-    for batch_num, batch in enumerate(batch_iterator(samples, args.batch_size)):
-        if args.batch_size > 1:
-            print(f"\n{'#'*80}")
-            print(f"BATCH {batch_num + 1}/{(len(samples) + args.batch_size - 1) // args.batch_size} ({len(batch)} samples)")
-            print(f"{'#'*80}")
+    total_batches = (len(samples) + args.batch_size - 1) // args.batch_size
 
-        for i, sample in enumerate(batch):
+    for batch_num, batch in enumerate(batch_iterator(samples, args.batch_size)):
+        print(f"\n{'#'*80}")
+        print(f"BATCH {batch_num + 1}/{total_batches} ({len(batch)} samples)")
+        print(f"{'#'*80}")
+
+        # Process entire batch with combined entity lists
+        batch_results = process_batch(
+            batch_samples=batch,
+            model=model,
+            processor=processor,
+            ensemble=ensemble,
+            gradnorm_extractor=gradnorm_extractor,
+            args=args,
+            use_shallow_fusion=args.use_shallow_fusion,
+        )
+
+        # Display results for each sample in the batch
+        for i, (sample, result) in enumerate(zip(batch, batch_results)):
             global_idx = sample_idx + i
             print(f"\n{'='*80}")
             print(f"SAMPLE {global_idx+1}/{len(samples)}: {sample['id']}")
             print("=" * 80)
             print(f"\nGround truth: {sample['text']}")
 
-            # Create per-sample shallow fusion processor if enabled
-            shallow_fusion_processor = None
-            if args.use_shallow_fusion:
-                entities = sample.get("entity_list", [])
-                if entities:
-                    bias_list = create_entity_bias_list(
-                        entities=entities,
-                        tokenizer=processor.tokenizer,
-                        lambda_val=args.lambda_val,
-                    )
-                    if len(bias_list) > 0:
-                        config = ShallowFusionConfig(global_scale=1.0)
-                        shallow_fusion_processor = ShallowFusionProcessor.from_bias_list(
-                            bias_list, config
-                        )
-                        print(f"  Shallow fusion: {len(bias_list)} entities loaded")
-                else:
-                    print("  Shallow fusion: No entities available for this sample")
-
             # Get audio duration
             audio = sample["audio"]
             duration = get_audio_duration(audio)
             longform_note = " (LONG-FORM)" if duration > 30 else ""
             print(f"Audio duration: {duration:.2f}s{longform_note}")
-
-            # Process full audio sample
-            result = process_sample(
-                audio=audio,
-                model=model,
-                processor=processor,
-                ensemble=ensemble,
-                gradnorm_extractor=gradnorm_extractor,
-                args=args,
-                shallow_fusion_processor=shallow_fusion_processor,
-            )
-
-            # Display long-form processing info
-            if result.is_longform and result.segments:
-                print(f"  Processed {len(result.segments)} segments for signal extraction")
 
             print(f"\nTranscription: {result.transcription}")
 
